@@ -14,14 +14,18 @@ from typing import List, Tuple, Dict
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
 
-# opzionali (per mappa e highlight avanzato)
 try:
     import altair as alt
 except Exception:
     alt = None
+
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+except Exception:
+    px = None
+    go = None
 
 try:
     import folium
@@ -62,57 +66,77 @@ def _parse_esempio_matrix_style(xl: pd.ExcelFile, sheet: str = None) -> Tuple[pd
     header_row_idx = None
     for r in range(0, min(20, len(raw))):
         row_vals = raw.iloc[r].astype(str).str.lower().tolist()
-        if any(v.strip() == 'codice' for v in row_vals):
+        if any(v.startswith('data') for v in row_vals):
             header_row_idx = r
             break
     if header_row_idx is None:
-        header_row_idx = 4
+        raise ValueError("Formato matrix: riga header con 'data_*' non trovata")
 
-    header_row = raw.iloc[header_row_idx]
+    header = raw.iloc[header_row_idx]
+    point_meta_idx = _detect_point_meta_cols(header)
 
-    date_cols = []
-    for c in raw.columns:
-        val = raw.iloc[0, c]
-        if isinstance(val, (str, dt.datetime, pd.Timestamp)):
-            try:
-                d = pd.to_datetime(val)
-                if d.year > 1990:
-                    date_cols.append((c, d))
-            except Exception:
-                pass
-    if not date_cols:
-        raise ValueError("Formato 'matrice' non riconosciuto: nessuna data nella prima riga.")
+    # trova blocchi per ogni epoca (data, X, Y, Z)
+    groups = []
+    rest = [i for i in range(len(header)) if i not in point_meta_idx.values()]
+    for i in range(0, len(rest), 4):
+        block = rest[i:i+4]
+        if len(block) < 4:
+            break
+        groups.append(block)
 
-    meta_rows = {'temperatura': 1, 'pressione': 2, 'misurata_flag': 3}
-    point_meta_idx = _detect_point_meta_cols(header_row)
+    # trova righe dati e righe meta opzionali
+    data_start = header_row_idx + 1
+    data_end = len(raw)
 
+    # mappa misurata → data
+    date_to_mis = {}
     records = []
-    sorted_dates = [d for _, d in sorted(date_cols, key=lambda x: x[0])]
-    date_to_mis = {d: i+1 for i, d in enumerate(sorted_dates)}
 
-    for (c_idx, dttm) in date_cols:
-        start_r = header_row_idx + 1
-        end_r = len(raw)
+    for block_cols in groups:
+        dcol, xcol, ycol, zcol = block_cols
+        dttm = pd.to_datetime(raw.iloc[data_start:data_end, dcol], errors='coerce')
+        if dttm.isna().all():
+            continue
+        # prima data valida
+        dttm = dttm.iloc[0]
+        date_to_mis[pd.to_datetime(dttm)] = len(date_to_mis)
+
+    if not date_to_mis:
+        raise ValueError("Nessuna epoca valida trovata nel formato matrix")
+
+    meta_rows = {'temperatura': None, 'pressione': None}
+
+    for block_cols in groups:
+        dcol, xcol, ycol, zcol = block_cols
+        dttm = raw.iloc[data_start:data_end, dcol].dropna()
+        if dttm.empty:
+            continue
+        dttm = pd.to_datetime(dttm.iloc[0], errors='coerce')
+        mis = date_to_mis[pd.to_datetime(dttm)]
+
+        # range righe punto
+        start_r, end_r = data_start, data_end
+
         block = pd.DataFrame({
             'codice': raw.iloc[start_r:end_r, point_meta_idx.get('codice', 0)].values,
             'descrizione': raw.iloc[start_r:end_r, point_meta_idx.get('descrizione', 1)].values,
-            'X': raw.iloc[start_r:end_r, c_idx].values,
-            'Y': raw.iloc[start_r:end_r, c_idx+1].values,
-            'Z': raw.iloc[start_r:end_r, c_idx+2].values,
+            'X': raw.iloc[start_r:end_r, xcol].values,
+            'Y': raw.iloc[start_r:end_r, ycol].values,
+            'Z': raw.iloc[start_r:end_r, zcol].values,
         })
         if 'prima_misurata' in point_meta_idx:
             block['prima_misurata'] = pd.to_numeric(raw.iloc[start_r:end_r, point_meta_idx['prima_misurata']].values, errors='coerce')
         else:
             block['prima_misurata'] = np.nan
         block['data'] = pd.to_datetime(dttm)
-        block['misurata'] = date_to_mis[pd.to_datetime(dttm)]
+        block['misurata'] = mis
         def _get_meta_val_row(ridx, col_idx):
             try:
                 return raw.iloc[ridx, col_idx]
             except Exception:
                 return None
-        block['temperatura'] = pd.to_numeric(_get_meta_val_row(meta_rows['temperatura'], c_idx), errors='coerce')
-        block['pressione'] = pd.to_numeric(_get_meta_val_row(meta_rows['pressione'], c_idx), errors='coerce')
+        block['temperatura'] = pd.to_numeric(_get_meta_val_row(meta_rows['temperatura'], xcol), errors='coerce')
+        block['pressione'] = pd.to_numeric(_get_meta_val_row(meta_rows['pressione'], xcol), errors='coerce')
         records.append(block)
 
     df_long = pd.concat(records, ignore_index=True)
@@ -136,69 +160,74 @@ def _parse_long_format(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
     rename_map = {
         'code': 'codice', 'id': 'codice', 'punto': 'codice', 'nome': 'codice',
         'desc': 'descrizione', 'descr': 'descrizione', 'descrizione': 'descrizione',
-        'date': 'data', 'epoch': 'data', 'epoca': 'data',
-        'e': 'X', 'east': 'X', 'easting': 'X', 'x': 'X',
-        'n': 'Y', 'north': 'Y', 'northing': 'Y', 'y': 'Y',
-        'z': 'Z', 'quota': 'Z', 'alt': 'Z', 'h': 'Z',
-        'prima_misurata':'prima_misurata','misurata_inizio':'prima_misurata', 'first_misurata':'prima_misurata'
+        'date': 'data', 'epoch': 'data', 'misurata': 'misurata',
+        'x':'X', 'y':'Y', 'z':'Z'
     }
-    lowercols = {c.lower(): c for c in df.columns}
-    final_cols = {}
-    for k, target in rename_map.items():
-        if k in lowercols:
-            final_cols[lowercols[k]] = target
-    df = df.rename(columns=final_cols)
+    df1 = df.rename(columns={c: rename_map.get(str(c).strip().lower(), c) for c in df.columns})
+    needed = {'codice','data','X','Y'}
+    if not needed.issubset(set(df1.columns)):
+        raise ValueError("Formato 'long' non valido: mancano colonne necessarie")
 
-    required = {'codice', 'data', 'X', 'Y'}
-    if not required.issubset(set(df.columns)):
-        raise ValueError("Formato lungo non riconosciuto: servono colonne almeno 'codice', 'data', 'X', 'Y'")
+    df1['codice'] = df1['codice'].astype(str).str.strip()
+    if 'descrizione' not in df1:
+        df1['descrizione'] = ''
+    if 'misurata' not in df1:
+        # mappa data → indice ordine
+        ord_map = {d: i for i, d in enumerate(sorted(pd.to_datetime(df1['data'].dropna().unique())))}
+        df1['misurata'] = pd.to_datetime(df1['data']).map(ord_map)
 
-    df['data'] = pd.to_datetime(df['data'], errors='coerce')
-    for c in ['X','Y','Z','prima_misurata']:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-        else:
-            df[c] = np.nan
-
-    order = {d:i+1 for i, d in enumerate(sorted(df['data'].dropna().unique()))}
-    df['misurata'] = df['data'].map(order)
+    for c in ['X','Y','Z']:
+        if c in df1:
+            df1[c] = pd.to_numeric(df1[c], errors='coerce')
 
     meta = {
-        'n_punti': df['codice'].nunique(),
-        'n_epoche': df['data'].nunique(),
-        'date': sorted(df['data'].dropna().unique()),
+        'n_punti': df1['codice'].nunique(),
+        'n_epoche': df1['misurata'].nunique(),
+        'date': sorted(pd.to_datetime(df1['data'].dropna().unique())),
         'sheet': None,
         'format': 'long',
         'title': None,
     }
-    return df[['codice','descrizione','prima_misurata','data','misurata','X','Y','Z']], meta
+    return df1, meta
 
-
-# --- Nuovo parser: formato ";" con prima riga titolo e seconda riga header ---
 
 def _parse_semicolon_wide_from_bytes(data: bytes) -> Tuple[pd.DataFrame, Dict]:
     text = data.decode('utf-8', errors='ignore')
-    # rimuovi righe completamente vuote in coda/testa
+    # rimuovi righe completamente vuote
     lines = [ln for ln in (l.strip() for l in text.splitlines()) if ln != '']
     if len(lines) < 2:
         raise ValueError("File troppo corto per il formato ';' con titolo + header")
 
     title_line = lines[0].strip()
+    # titolo può includere anche il sistema di coordinate es.: "BAITA;UTM32" oppure "LAVORO;Sistema Locale"
+    parts = [p.strip() for p in title_line.split(';') if p.strip() != '']
+    title = parts[0] if parts else None
+    coord_raw = parts[1].lower() if len(parts) > 1 else None
+    if coord_raw in {'utm32', 'utm 32'}:
+        coord_sys = 'UTM32'
+    elif coord_raw in {'utm33', 'utm 33'}:
+        coord_sys = 'UTM33'
+    elif coord_raw in {'sistema locale', 'locale'}:
+        coord_sys = 'Sistema Locale'
+    else:
+        coord_sys = None  # manterremo default più avanti
+
     csv_text = '\n'.join(lines[1:])
 
     df0 = pd.read_csv(io.StringIO(csv_text), sep=';', engine='python')
     # elimina colonne vuote create da ';' finali
     df0 = df0.loc[:, [c for c in df0.columns if str(c).strip().lower() != 'unnamed: 0']]
 
-    # trova colonne codice/descrizione (case-insensitive)
+    # trova colonne meta (case-insensitive)
     cols_lower = {str(c).strip().lower(): c for c in df0.columns}
     if 'codice' not in cols_lower or 'descrizione' not in cols_lower:
         raise ValueError("Header non valido: attese colonne 'Codice' e 'Descrizione' nella seconda riga")
     c_code = cols_lower['codice']
     c_desc = cols_lower['descrizione']
+    c_tipo = cols_lower.get('tipologia', None)
 
     # colonne successive: gruppi da 4 (data, X, Y, Z) per epoca
-    rest = [c for c in df0.columns if c not in (c_code, c_desc)]
+    rest = [c for c in df0.columns if c not in (c_code, c_desc) and (c_tipo is None or c != c_tipo)]
     groups = []
     for i in range(0, len(rest), 4):
         block = rest[i:i+4]
@@ -209,26 +238,28 @@ def _parse_semicolon_wide_from_bytes(data: bytes) -> Tuple[pd.DataFrame, Dict]:
     records = []
     for _, row in df0.iterrows():
         code = str(row[c_code]).strip()
-        desc = str(row[c_desc]).strip() if not pd.isna(row[c_desc]) else ''
-        for gi, (dcol, xcol, ycol, zcol) in enumerate(groups, start=1):
+        desc = str(row[c_desc]).strip()
+        tipo = str(row[c_tipo]).strip() if c_tipo is not None else None
+        for gi, (dcol, xcol, ycol, zcol) in enumerate(groups, start=0):
             dval = row[dcol]
             x = pd.to_numeric(row[xcol], errors='coerce')
             y = pd.to_numeric(row[ycol], errors='coerce')
             z = pd.to_numeric(row[zcol], errors='coerce')
             if pd.isna(dval) and pd.isna(x) and pd.isna(y) and pd.isna(z):
                 continue
-            # data: può essere numero stile Excel (44430) o stringa
+            # data: può essere numero stile Excel (anche float) o stringa
             date = pd.NaT
             if not pd.isna(dval):
                 try:
                     if isinstance(dval, (int, float)) and not pd.isna(dval):
-                        # Excel serial date (origin 1899-12-30)
-                        date = pd.to_datetime('1899-12-30') + pd.to_timedelta(int(dval), unit='D')
+                        # Excel serial date (origin 1899-12-30) – conserva anche la frazione di giorno
+                        days = float(dval)
+                        date = pd.to_datetime('1899-12-30') + pd.to_timedelta(days, unit='D')
                     else:
                         date = pd.to_datetime(dval, dayfirst=True, errors='coerce')
                 except Exception:
                     date = pd.to_datetime(dval, dayfirst=True, errors='coerce')
-            records.append({'codice': code, 'descrizione': desc, 'data': date, 'misurata': gi, 'X': x, 'Y': y, 'Z': z})
+            records.append({'codice': code, 'descrizione': desc, 'tipologia': tipo, 'data': date, 'misurata': gi, 'X': x, 'Y': y, 'Z': z})
 
     df_long = pd.DataFrame.from_records(records)
     if df_long.empty:
@@ -240,10 +271,15 @@ def _parse_semicolon_wide_from_bytes(data: bytes) -> Tuple[pd.DataFrame, Dict]:
         'date': sorted(df_long['data'].dropna().unique()),
         'sheet': None,
         'format': 'semicolon_wide',
-        'title': title_line,
+        'title': title,
+        'coord_sys': coord_sys,
     }
     return df_long, meta
 
+
+# -----------------------------
+# Ingest
+# -----------------------------
 
 def parse_upload(file: io.BytesIO) -> Tuple[pd.DataFrame, Dict]:
     name = getattr(file, 'name', 'upload')
@@ -261,7 +297,7 @@ def parse_upload(file: io.BytesIO) -> Tuple[pd.DataFrame, Dict]:
 
     elif suffix in ['.csv', '.txt']:
         # leggi bytes una volta sola, prova prima nuovo formato ';' con titolo
-        data = file.read()
+        data = file.read() if hasattr(file, 'read') else file
         try:
             return _parse_semicolon_wide_from_bytes(data)
         except Exception:
@@ -303,11 +339,10 @@ def compute_displacements(df_long: pd.DataFrame, ref_epoch: int) -> pd.DataFrame
 
 st.set_page_config(page_title="Monitoraggio Topografico", layout="wide")
 
-# Caricamento
 with st.sidebar:
-    st.header("Caricamento dati")
+    st.header("Caricamento")
     up = st.file_uploader("Carica file (.xlsx, .xls, .csv, .txt)", type=["xlsx","xls","csv","txt"], accept_multiple_files=False)
-    st.caption("Nuovo formato supportato: prima riga titolo; seconda riga header con 'Codice;Descrizione;data_1;X_1;Y_1;Z_1;...' (separatore ';').")
+    st.caption("Nuovo formato supportato: prima riga 'TITOLO;SISTEMA' (SISTEMA ∈ {Sistema Locale, UTM32, UTM33}); seconda riga = header con 'Codice;Descrizione;Tipologia;data_0;X_0;Y_0;Z_0;...'.")
 
     st.divider()
     st.header("Impostazioni")
@@ -322,25 +357,16 @@ if up is None:
 try:
     df_long, meta = parse_upload(up)
 except Exception as e:
-    st.error(f"Errore di parsing: {e}")
+    st.error(f"Errore nel parsing: {e}")
     st.stop()
 
-# Titolo pagina dinamico dal file
-page_title_suffix = str(meta.get('title') or '').strip()
-if page_title_suffix:
-    st.title(f"📐 MONITORAGGIO TOPOGRAFICO – {page_title_suffix.upper()}")
-else:
-    st.title("📐 MONITORAGGIO TOPOGRAFICO – Dashboard Interattiva")
+# garantisci presenza colonna tipologia
+if 'tipologia' not in df_long.columns:
+    df_long['tipologia'] = np.nan
 
-# Pulizia
-df_long = df_long.dropna(subset=['codice','data'])
-df_long['data'] = pd.to_datetime(df_long['data'])
-
-# Misurate
-mis_sorted = sorted(
-    df_long[['misurata','data']].dropna().drop_duplicates().sort_values('misurata').itertuples(index=False),
-    key=lambda x: x[0]
-)
+# Info base
+min_d, max_d = pd.to_datetime(df_long['data']).min(), pd.to_datetime(df_long['data']).max()
+mis_sorted = sorted({int(m): d for m,d in df_long[['misurata','data']].dropna().drop_duplicates().values}.items())
 mis_to_date = {int(m): pd.to_datetime(d) for m, d in mis_sorted}
 all_mis = sorted(mis_to_date.keys())
 
@@ -376,7 +402,8 @@ with st.sidebar:
     st.session_state.misurate_sel = misurate_sel
     st.session_state.selection_mode = mode
 
-    ref_m = st.selectbox("Misurata di riferimento (globale)", options=all_mis, index=0, format_func=lambda m: f"Misurata {m} – {mis_to_date[m].date()}")
+    ref_m = st.selectbox("Misurata di riferimento (globale)", options=all_mis,
+                         index=0, format_func=lambda m: f"Misurata {m} – {mis_to_date[m].date()}")
 
     codes = sorted(df_long['codice'].unique())
     selected_codes = st.multiselect("Punti", options=codes, default=[])
@@ -392,98 +419,14 @@ res_f = res[mask].copy()
 if disp_thresh and disp_thresh > 0:
     res_f = res_f[(res_f['d2D'].abs() >= disp_thresh)]
 
-# KPI
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.metric("Punti", int(res_f['codice'].nunique()))
-with c2:
-    st.metric("Misurate selezionate", len(sorted(set(res_f['misurata']))))
-with c3:
-    m2d = res_f.groupby('codice')['d2D'].max().max()
-    st.metric("Spost. max 2D (m)", f"{(m2d if pd.notna(m2d) else 0):.3f}")
-with c4:
-    mz = res_f['dZ'].abs().max()
-    st.metric("Spost. max Z (m)", f"{(mz if pd.notna(mz) else 0):.3f}")
+# KPI veloci
+col_k1, col_k2, col_k3, col_k4 = st.columns(4)
+col_k1.metric("N. punti", int(res_f['codice'].nunique()))
+col_k2.metric("N. misurate", int(res_f['misurata'].nunique()))
+col_k3.metric("Max d2D (m)", f"{res_f['d2D'].abs().max():.3f}" if not res_f.empty else "-")
+col_k4.metric("Max |dZ| (m)", f"{res_f['dZ'].abs().max():.3f}" if not res_f.empty else "-")
 
 st.divider()
-
-# =========================
-# Vista planare – spostamenti (coordinate locali, colore per misurata)
-# =========================
-
-st.subheader("Vista planare – spostamenti")
-
-# Pulsanti misurate sotto il titolo
-st.caption("Attiva/Disattiva misurate")
-btn_selected = []
-cols_per_row = 10
-rows = (len(all_mis) + cols_per_row - 1) // cols_per_row
-for r in range(rows):
-    cols = st.columns(min(cols_per_row, len(all_mis) - r*cols_per_row))
-    for i, m in enumerate(all_mis[r*cols_per_row : (r+1)*cols_per_row]):
-        default_on = m in st.session_state.misurate_sel
-        with cols[i]:
-            state = st.checkbox(str(m), value=default_on, key=f"mis_btn_{m}")
-            if state:
-                btn_selected.append(m)
-
-btn_selected_sorted = sorted(btn_selected)
-if set(btn_selected_sorted) != set(st.session_state.misurate_sel):
-    st.session_state.misurate_sel = btn_selected_sorted
-    st.session_state.selection_mode = 'Personalizzata'
-
-misurate_sel = st.session_state.misurate_sel if st.session_state.misurate_sel else all_mis
-mask_buttons = res['misurata'].isin(misurate_sel)
-if selected_codes:
-    mask_buttons &= res['codice'].isin(selected_codes)
-res_btn = res[mask_buttons].copy()
-if disp_thresh and disp_thresh > 0:
-    res_btn = res_btn[(res_btn['d2D'].abs() >= disp_thresh)]
-
-# Coordinate locali (baseline: prima misurata nel subset per punto)
-local_df = res_btn.copy()
-firsts = local_df.sort_values('misurata').groupby('codice')[['X','Y']].first().rename(columns={'X':'Xb','Y':'Yb'})
-local_df = local_df.merge(firsts, left_on='codice', right_index=True, how='left')
-local_df['lX'] = local_df['X'] - local_df['Xb']
-local_df['lY'] = local_df['Y'] - local_df['Yb']
-local_df['ld2D'] = np.sqrt(local_df['lX']**2 + local_df['lY']**2)
-
-# Chart: Altair (hover → evidenzia stesso codice), fallback Plotly
-if alt is not None and not local_df[['lX','lY']].dropna().empty:
-    x_min, x_max = local_df['lX'].min(), local_df['lX'].max()
-    y_min, y_max = local_df['lY'].min(), local_df['lY'].max()
-    span = float(max(x_max - x_min, y_max - y_min)) if np.isfinite([x_min, x_max, y_min, y_max]).all() else 1.0
-    cx = float((x_max + x_min)/2.0) if np.isfinite([x_min, x_max]).all() else 0.0
-    cy = float((y_max + y_min)/2.0) if np.isfinite([y_min, y_max]).all() else 0.0
-    dom_x = [cx - span/2.0, cx + span/2.0]
-    dom_y = [cy - span/2.0, cy + span/2.0]
-
-    hover = alt.selection_single(fields=['codice'], on='mouseover', nearest=True, empty='none')
-    base = alt.Chart(local_df).mark_circle(size=60).encode(
-        x=alt.X('lX:Q', scale=alt.Scale(domain=dom_x), title='ΔX locale (m)'),
-        y=alt.Y('lY:Q', scale=alt.Scale(domain=dom_y), title='ΔY locale (m)'),
-        color=alt.Color('misurata:N', legend=alt.Legend(title='Misurata')),
-        tooltip=['codice','descrizione','misurata','data:T','ld2D:Q']
-    ).properties(width=600, height=600)
-
-    chart = base.encode(opacity=alt.condition(hover, alt.value(1), alt.value(0.2))).add_selection(hover)
-    st.altair_chart(chart, use_container_width=False)
-else:
-    fig_scatter = px.scatter(local_df, x='lX', y='lY', color='misurata',
-                             hover_data={'codice':True,'descrizione':True,'misurata':True,'data':True,'ld2D':':.3f'},
-                             labels={'lX':'ΔX locale (m)', 'lY':'ΔY locale (m)', 'misurata':'Misurata'},
-                             title="Spostamenti locali per misurata")
-    fig_scatter.update_yaxes(scaleanchor="x", scaleratio=1)
-    fig_scatter.update_layout(margin=dict(l=10,r=10,t=40,b=10), legend_title_text="Misurata")
-    st.plotly_chart(fig_scatter, use_container_width=True)
-    if alt is None:
-        st.info("Per evidenziare automaticamente il punto al passaggio del mouse, installa Altair: `pip install altair`.")
-
-st.divider()
-
-# =========================
-# Tabella confronto tra misurate (ref vs confronto)
-# =========================
 
 st.subheader("Tabella punti – confronto tra misurate")
 col_ref, col_cmp = st.columns(2)
@@ -545,10 +488,8 @@ st.download_button(
 st.divider()
 
 # =========================
-# Inspector punto – mappa a larghezza piena, spostamenti e velocità
+# Mappa + Inspector punto (mappa sopra, inspector sotto) – aggiornati
 # =========================
-
-st.subheader("Inspector punto")
 
 all_codes_sorted = sorted(res['codice'].unique())
 if not all_codes_sorted:
@@ -556,26 +497,43 @@ if not all_codes_sorted:
 else:
     # --- Mappa (scelta sfondo) a larghezza piena ---
     st.markdown("### Mappa punti")
-    map_bg = st.selectbox(
-        "Sfondo mappa",
-        ["Nessuna mappa (locale)", "OpenStreetMap Standard", "Google Satellite", "Esri Satellite"],
-        index=1
-    )
-
-    first_pts = df_long.sort_values('misurata').groupby('codice').first().reset_index()[['codice','descrizione','X','Y']]
-
-    if map_bg != "Nessuna mappa (locale)" and (folium is None or st_folium is None or Transformer is None):
-        st.warning("Per la mappa interattiva servono i pacchetti: `folium`, `streamlit-folium`, `pyproj`.")
-        map_bg = "Nessuna mappa (locale)"
-
-    if map_bg == "Nessuna mappa (locale)":
-        fig_local = px.scatter(first_pts, x='X', y='Y', hover_data=['codice','descrizione'])
-        fig_local.update_yaxes(scaleanchor="x", scaleratio=1, showticklabels=False, showgrid=False, zeroline=False, title_text=None)
-        fig_local.update_xaxes(showticklabels=False, showgrid=False, zeroline=False, title_text=None, constrain='domain')
-        fig_local.update_layout(height=500, margin=dict(l=0,r=0,t=10,b=0), showlegend=False)
-        st.plotly_chart(fig_local, use_container_width=True)
+    # Determina sistema di coordinate dal meta (nuovo formato) o default UTM32
+    coord_sys = meta.get('coord_sys', None)
+    # Opzioni sfondo in base al sistema
+    if coord_sys == 'Sistema Locale':
+        map_options = ["Mappa Locale"]
+        default_idx = 0
     else:
-        epsg_in = 32632
+        map_options = ["Mappa Locale", "OpenStreetMap", "Google Satellite", "Esri Satellite"]
+        default_idx = 1
+    map_bg = st.selectbox("Sfondo mappa", map_options, index=default_idx)
+
+    # primo rilievo per ogni punto + tipologia (per colore)
+    first_pts = df_long.sort_values('misurata').groupby('codice').first().reset_index()[['codice','descrizione','X','Y']]
+    if 'tipologia' in df_long.columns:
+        tipo_map = df_long.sort_values('misurata').groupby('codice').first().reset_index()[['codice','tipologia']]
+        first_pts = first_pts.merge(tipo_map, on='codice', how='left')
+    else:
+        first_pts['tipologia'] = None
+
+    # se non locale e pacchetti mancanti, fallback a mappa locale
+    if map_bg != "Mappa Locale" and (folium is None or st_folium is None or Transformer is None):
+        st.warning("Per la mappa interattiva servono i pacchetti: `folium`, `streamlit-folium`, `pyproj`.")
+        map_bg = "Mappa Locale"
+
+    if map_bg == "Mappa Locale":
+        # scatter XY in sistema locale/UTM senza sfondo web – colori per tipologia
+        if px is None:
+            st.info("Plotly non disponibile")
+        else:
+            fig_local = px.scatter(first_pts, x='X', y='Y', color='tipologia', hover_data=['codice','descrizione','tipologia'])
+            fig_local.update_yaxes(scaleanchor="x", scaleratio=1, showticklabels=False, showgrid=False, zeroline=False, title_text=None)
+            fig_local.update_xaxes(showticklabels=False, showgrid=False, zeroline=False, title_text=None)
+            fig_local.update_layout(margin=dict(l=0,r=0,t=10,b=0), showlegend=True)
+            st.plotly_chart(fig_local, use_container_width=True)
+    else:
+        # Trasformazione UTM32/33 → WGS84
+        epsg_in = 32633 if meta.get("coord_sys")=="UTM33" else 32632
         transformer = Transformer.from_crs(epsg_in, 4326, always_xy=True)
         lons, lats = [], []
         for _, row in first_pts.iterrows():
@@ -587,38 +545,144 @@ else:
         for _, row in first_pts.iterrows():
             features.append({
                 'type':'Feature',
-                'properties':{'codice': str(row['codice']), 'descrizione': str(row['descrizione'])},
+                'properties':{'codice': str(row['codice']), 'descrizione': str(row['descrizione']), 'tipologia': (None if pd.isna(row.get('tipologia')) else str(row.get('tipologia')))},
                 'geometry':{'type':'Point','coordinates':[row['lon'], row['lat']]}
             })
         geojson = {'type':'FeatureCollection','features':features}
 
         center = [float(np.nanmean(first_pts['lat'])), float(np.nanmean(first_pts['lon']))]
         m = folium.Map(location=center, zoom_start=18, tiles=None)
-        if map_bg == "OpenStreetMap Standard":
+        if map_bg == "OpenStreetMap":
             folium.TileLayer(tiles='OpenStreetMap', name='OSM Standard', control=False).add_to(m)
         elif map_bg == "Google Satellite":
-            folium.TileLayer(tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google', name='Google Satellite', control=False, max_zoom=20).add_to(m)
+            folium.TileLayer(tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', name='Google Satellite', control=False, max_zoom=20, attr='Google').add_to(m)
         else:
-            folium.TileLayer(tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri', name='Esri Satellite', control=False, max_zoom=20).add_to(m)
+            folium.TileLayer(tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', name='Esri Satellite', control=False, max_zoom=20, attr='Esri').add_to(m)
 
-        gj = folium.GeoJson(geojson, name='Punti', tooltip=folium.GeoJsonTooltip(fields=['codice','descrizione']))
+        # palette per tipologia
+        tipos = sorted([t for t in first_pts['tipologia'].dropna().unique().tolist()]) if 'tipologia' in first_pts.columns else []
+        base_colors = [
+            "#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
+            "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"
+        ]
+        color_map = {t: base_colors[i % len(base_colors)] for i, t in enumerate(tipos)}
+
+        # >>> NUOVO: scegli i campi del tooltip in base al sistema di coordinate
+        coord_sys = meta.get('coord_sys', None)
+        is_utm = coord_sys in ('UTM32', 'UTM33', 'UTM')
+        tooltip_fields = ['codice', 'descrizione'] if is_utm else ['codice', 'descrizione', 'tipologia']
+
+        def _style_fun(feat):
+            t = feat['properties'].get('tipologia')
+            col = color_map.get(t, "#3388ff")
+            return {'color': col, 'fillColor': col, 'fillOpacity': 0.8, 'radius': 6}
+
+        gj = folium.GeoJson(
+            geojson,
+            name='Punti',
+            tooltip=folium.GeoJsonTooltip(fields=tooltip_fields),  # <<< cambiato
+            marker=folium.CircleMarker(),
+            style_function=_style_fun
+        )
         gj.add_to(m)
 
+        # >>> NUOVO: in UTM aggiungo label/marker personalizzati con codice
+        if is_utm:
+            # funzione per creare l'HTML del pallino con codice
+            def _label_html(code_str, bg_color):
+                code_str = str(code_str)
+                if len(code_str) <= 4:
+                    # testo dentro al pallino
+                    return f"""
+                    <div style="
+                        pointer-events:none;
+                        display:flex; align-items:center; justify-content:center;
+                        width:28px; height:28px; border-radius:50%;
+                        background:{bg_color}; color:white; font-weight:700; font-size:12px;
+                        border:2px solid rgba(0,0,0,0.25); box-shadow:0 0 4px rgba(0,0,0,0.2);
+                    ">{code_str}</div>"""
+                else:
+                    # pallino + testo a lato
+                    return f"""
+                    <div style="pointer-events:none; display:flex; align-items:center; gap:6px;">
+                        <div style="
+                            width:14px; height:14px; border-radius:50%;
+                            background:{bg_color}; border:2px solid rgba(0,0,0,0.25);
+                            box-shadow:0 0 4px rgba(0,0,0,0.2);
+                        "></div>
+                        <span style="
+                            padding:2px 6px; background:rgba(255,255,255,0.9);
+                            border-radius:6px; border:1px solid rgba(0,0,0,0.15);
+                            font-weight:600; font-size:12px; color:#111;
+                        ">{code_str}</span>
+                    </div>"""
+
+            # aggiungo un Marker con DivIcon per ogni feature (sovrapposto al GeoJson)
+            for feat in geojson.get('features', []):
+                props = feat.get('properties', {})
+                geom = feat.get('geometry', {})
+                if not geom or geom.get('type') != 'Point':
+                    continue
+                # attenzione all'ordine GeoJSON: [lon, lat]
+                lon, lat = geom.get('coordinates', [None, None])[:2]
+                if lat is None or lon is None:
+                    continue
+                tip = props.get('tipologia')
+                col = color_map.get(tip, "#3388ff")
+                code_str = props.get('codice', '')
+                html = _label_html(code_str, col)
+
+                folium.Marker(
+                    location=[lat, lon],
+                    icon=folium.DivIcon(
+                        html=html,
+                        class_name='empty',  # nessun CSS extra
+                        icon_size=(0, 0),    # lasciamo al contenuto il suo size
+                        icon_anchor=(14, 14) # ancora approssimativa al centro
+                    )
+                ).add_to(m)
+
         out = st_folium(m, height=520, width=None, returned_objects=['last_object_clicked'])
+
+        # click mappa: aggiorna solo se cambia e poi rerun
         if out and out.get('last_object_clicked') and out['last_object_clicked'].get('properties'):
             props = out['last_object_clicked']['properties']
             if 'codice' in props:
-                st.session_state.selected_code = str(props['codice'])
+                new_code = str(props['codice'])
+                if st.session_state.get('selected_code') != new_code:
+                    st.session_state.selected_code = new_code
+                    st.rerun()
+
 
     # --- Selezione punto sotto la mappa ---
-    if st.session_state.selected_code is None or st.session_state.selected_code not in all_codes_sorted:
-        st.session_state.selected_code = all_codes_sorted[0]
-    code_sel = st.selectbox("Seleziona punto", options=all_codes_sorted,
-                            index=all_codes_sorted.index(st.session_state.selected_code),
-                            key='code_select')
-    st.session_state.selected_code = code_sel
 
-    # Dati punto selezionato
+    try:
+        all_codes_sorted = sorted(map(str, first_pts['codice'].dropna().unique().tolist()))
+    except Exception:
+        all_codes_sorted = []
+
+    if not all_codes_sorted:
+        st.warning("Nessun punto disponibile con i filtri correnti.")
+        st.stop()
+
+    # inizializza se mancante o non valido
+    if 'selected_code' not in st.session_state or \
+       st.session_state.selected_code not in all_codes_sorted:
+        st.session_state.selected_code = all_codes_sorted[0]
+
+    st.subheader("Inspector punto")
+
+    # 2) Selectbox: usa SOLO la key, niente index
+    st.selectbox(
+        "Seleziona punto",
+        options=all_codes_sorted,
+        key='selected_code'
+    )    
+
+    # =========================
+    # Dati punto selezionato – GRAFICI
+    # =========================
+    
     pt = res[res['codice'] == st.session_state.selected_code].sort_values('misurata')
     current_mis = st.session_state.misurate_sel if st.session_state.misurate_sel else all_mis
     pt = pt[pt['misurata'].isin(current_mis)].copy()
@@ -626,36 +690,102 @@ else:
     if len(pt) == 0:
         st.info("Il punto non ha misurate nella selezione corrente.")
     else:
-        base_x = pt.iloc[0]['X']; base_y = pt.iloc[0]['Y']
+        # Base locale sul PRIMO campione della selezione corrente
+        base_x = pt.iloc[0]['X']; base_y = pt.iloc[0]['Y']; base_z = pt.iloc[0]['Z']
+
+        # CUMULATE rispetto alla prima data della selezione – tutte partono da 0
         pt['cum_dX'] = pt['X'] - base_x
         pt['cum_dY'] = pt['Y'] - base_y
-        pt['step_dX'] = pt['cum_dX'].diff().fillna(pt['cum_dX'])
-        pt['step_dY'] = pt['cum_dY'].diff().fillna(pt['cum_dY'])
+        pt['cum_dZ'] = pt['Z'] - base_z
 
+        # ---------- Spostamenti nel piano (ΔX, ΔY) ----------
         cc1, cc2 = st.columns(2)
         with cc1:
             fig_vec = go.Figure()
-            fig_vec.add_trace(go.Scatter(x=[0], y=[0], mode='markers', name='Origine'))
-            fig_vec.add_trace(go.Scatter(x=pt['cum_dX'], y=pt['cum_dY'], mode='lines+markers', name='Cumulativo', showlegend=True))
-            prev_x, prev_y = 0.0, 0.0
-            for _, row in pt.iterrows():
-                x1, y1 = row['cum_dX'], row['cum_dY']
-                mis_label = f"Misurata {int(row['misurata'])}"
-                fig_vec.add_trace(go.Scatter(x=[prev_x, x1], y=[prev_y, y1], mode='lines+markers', name=mis_label, showlegend=True))
-                prev_x, prev_y = x1, y1
-            fig_vec.update_layout(title=f"Spostamenti nel tempo – {st.session_state.selected_code}", xaxis_title="ΔX (m)", yaxis_title="ΔY (m)", margin=dict(l=10, r=10, t=40, b=10), legend=dict(yanchor='top', y=1, xanchor='left', x=1.02))
+
+            # PALETTE per misurate (usiamo una palette qualitativa)
+            palette = px.colors.qualitative.Plotly if px else [
+                "#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
+                "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"
+            ]
+
+            # segmenti colorati + marker e legenda per OGNI misurata                 # >>> MOD
+            pt_r = pt.reset_index(drop=True)
+            for i, row in pt_r.iterrows():
+                color = palette[i % len(palette)]
+                label = f"Misurata {int(row['misurata'])} – {pd.to_datetime(row['data']).date()}"
+
+                # segmento dal punto precedente a quello corrente (se esiste)
+                if i > 0:
+                    prev = pt_r.loc[i-1]
+                    fig_vec.add_trace(go.Scatter(
+                        x=[prev['cum_dX'], row['cum_dX']],
+                        y=[prev['cum_dY'], row['cum_dY']],
+                        mode='lines',
+                        line=dict(width=2, color=color),
+                        hoverinfo='skip',
+                        showlegend=False
+                    ))
+
+                # marker con legenda
+                fig_vec.add_trace(go.Scatter(
+                    x=[row['cum_dX']], y=[row['cum_dY']],
+                    mode='markers',
+                    marker=dict(size=9, color=color),
+                    name=label,
+                    hovertemplate=("ΔX: %{x:.3f} m<br>ΔY: %{y:.3f} m<br>" +
+                                   f"{label}<extra></extra>")
+                ))
+
+            fig_vec.update_layout(
+                title=f"Spostamenti nel piano – punto {st.session_state.selected_code}",
+                xaxis_title="ΔX (m)", yaxis_title="ΔY (m)",
+                margin=dict(l=10, r=10, t=40, b=10),
+                legend=dict(orientation='v', x=0.01, y=0.99)
+            )
             fig_vec.update_yaxes(scaleanchor="x", scaleratio=1)
             fig_vec.update_xaxes(constrain='domain')
             st.plotly_chart(fig_vec, use_container_width=True)
 
+        # ---------- Velocità / Componenti degli spostamenti ----------
         with cc2:
+            coord_sys = meta.get('coord_sys', None)
+            if coord_sys in ('UTM32', 'UTM33', 'UTM'):                                   # >>> MOD
+                lblX, lblY, lblZ = "Est", "Nord", "Quota"
+            else:
+                lblX, lblY, lblZ = "X", "Y", "Z"
+
             fig_vel = go.Figure()
-            fig_vel.add_trace(go.Scatter(x=pt['data'], y=pt['d2D'], mode='lines+markers', name='d2D (m) – rif. globale'))
-            if pt['dZ'].notna().any():
-                fig_vel.add_trace(go.Scatter(x=pt['data'], y=pt['dZ'], mode='lines+markers', name='dZ (m) – rif. globale'))
-            fig_vel.add_trace(go.Scatter(x=pt['data'], y=pt['d3D'], mode='lines+markers', name='d3D (m) – rif. globale'))
-            fig_vel.update_layout(title=f"Velocità degli spostamenti – {st.session_state.selected_code}", xaxis_title="Data (mese/anno)", yaxis_title="Valore (m)", margin=dict(l=10, r=10, t=40, b=10))
+            # COLORI richiesti: X/Est=Rosso, Y/Nord=Verde, Z/Quota=Blu                 # >>> MOD
+            color_x = "red"
+            color_y = "green"
+            color_z = "blue"
+
+            # Rinomina grafico: "Velocità degli spostamenti"                            # >>> MOD
+            fig_vel.add_trace(go.Scatter(
+                x=pt['data'], y=pt['cum_dX'], mode='lines+markers',
+                name=f"Δ{lblX} (m)",
+                line=dict(color=color_x), marker=dict(color=color_x)
+            ))
+            fig_vel.add_trace(go.Scatter(
+                x=pt['data'], y=pt['cum_dY'], mode='lines+markers',
+                name=f"Δ{lblY} (m)",
+                line=dict(color=color_y), marker=dict(color=color_y)
+            ))
+            if pt['cum_dZ'].notna().any():
+                fig_vel.add_trace(go.Scatter(
+                    x=pt['data'], y=pt['cum_dZ'], mode='lines+markers',
+                    name=f"Δ{lblZ} (m)",
+                    line=dict(color=color_z), marker=dict(color=color_z)
+                ))
+
+            fig_vel.update_layout(
+                title=f"Velocità degli spostamenti – punto {st.session_state.selected_code}",  # >>> MOD
+                xaxis_title="Data", yaxis_title="Variazione (m)",
+                margin=dict(l=10, r=10, t=40, b=10),
+                legend=dict(orientation='h', yanchor='bottom', y=0, xanchor='center', x=0.5)
+            )
             fig_vel.update_xaxes(tickformat="%b %Y")
             st.plotly_chart(fig_vel, use_container_width=True)
-
+            
 st.divider()
