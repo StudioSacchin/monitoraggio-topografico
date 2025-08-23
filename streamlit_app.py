@@ -1,6 +1,6 @@
 # monitoraggio.py
 # Web app per monitoraggio topografico
-# import file csv generato monitoraggio Studio Sacchin
+# import file txt generato da file di monitoraggio Studio Sacchin
 # applicazione creata da Luis Saggiomo con l'ausilio di ChatGPT5
 # Studio Sacchin
 
@@ -349,8 +349,8 @@ with st.sidebar:
     st.caption("Seleziona le misurate da analizzare. Modalità predefinita: Intero periodo.")
 
 if up is None:
-    st.title("📐 MONITORAGGIO TOPOGRAFICO")
-    st.info("🔼 Carica un file per iniziare. Puoi usare direttamente il file di esempio.")
+    st.title("📐 STUDIO SACCHIN - MONITORAGGIO TOPOGRAFICO")
+    st.info("🔼 Carica un file per iniziare.")
     st.stop()
 
 # Parsing
@@ -359,6 +359,16 @@ try:
 except Exception as e:
     st.error(f"Errore nel parsing: {e}")
     st.stop()
+
+#Titolo dinamico della paginain base al file
+titolo_importato = meta.get("title", "Monitoraggio senza nome")
+
+# Variante 1: tutto su una riga
+# st.title(f"📐 STUDIO SACCHIN - MONITORAGGIO TOPOGRAFICO – {titolo_importato}")
+
+# Variante 2: titolo fisso sopra e sotto quello importato
+st.title("📐 STUDIO SACCHIN - MONITORAGGIO TOPOGRAFICO")
+st.subheader(titolo_importato)
 
 # garantisci presenza colonna tipologia
 if 'tipologia' not in df_long.columns:
@@ -458,7 +468,7 @@ comp['dZ'] = comp['Z_cmp'] - comp['Z_ref']
 comp['vettore_2D'] = np.sqrt(comp['dX']**2 + comp['dY']**2)
 comp['vettore_3D'] = np.sqrt(comp['vettore_2D']**2 + (comp['dZ']**2))
 
-# Applica i filtri globali: punti selezionati e soglia d2D (se impostata)
+# --- Applica filtri ---
 if selected_codes:
     comp = comp[comp['codice'].isin(selected_codes)]
 if disp_thresh and disp_thresh > 0:
@@ -469,20 +479,29 @@ cols_show = [
     'X_ref','Y_ref','Z_ref','X_cmp','Y_cmp','Z_cmp',
     'dX','dY','dZ','vettore_2D','vettore_3D'
 ]
-comp_visible = comp[cols_show].sort_values('vettore_2D', ascending=False)
 
-st.dataframe(comp_visible, use_container_width=True)
+# ordina per codice crescente e resetta l'indice (così non appare la colonna numerica a sinistra)
+comp_visible = comp[cols_show].sort_values('codice', ascending=True).reset_index(drop=True)
 
-# Download CSV subito sotto la tabella, con i dati VISIBILI
+# mostra tabella SENZA indice
+st.dataframe(comp_visible, use_container_width=True, hide_index=True)
+
+# Download XLSX subito sotto la tabella, con i dati VISIBILI
 @st.cache_data
-def _to_csv(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode('utf-8')
+def _to_xlsx(df: pd.DataFrame) -> bytes:
+    from io import BytesIO
+    buffer = BytesIO()
+    # usa openpyxl (di solito già presente in Streamlit Cloud)
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Confronto")
+    buffer.seek(0)
+    return buffer.getvalue()
 
 st.download_button(
-    "⬇️ Scarica tabella (CSV)",
-    data=_to_csv(comp_visible),
-    file_name=f"confronto_misurate_{int(ref_tab)}_vs_{int(cmp_tab)}.csv",
-    mime="text/csv"
+    "⬇️ Scarica tabella (XLSX)",
+    data=_to_xlsx(comp_visible),
+    file_name=f"confronto_misurate_{int(ref_tab)}_vs_{int(cmp_tab)}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
 st.divider()
@@ -787,5 +806,85 @@ else:
             )
             fig_vel.update_xaxes(tickformat="%b %Y")
             st.plotly_chart(fig_vel, use_container_width=True)
+
+        # ---------- Tabella dettaglio misurate del punto ----------
+        sel_code = st.session_state.selected_code
+        st.markdown(f"#### Dati misurate del punto {sel_code}")
+
+        # ricostruisco i dati del punto selezionato e ordino per data crescente
+        sel_code = st.session_state.selected_code
+        pt_tab = res[res['codice'].astype(str) == str(sel_code)].copy()
+
+        # se hai un filtro misurate attivo, manteniamolo coerente con i grafici
+        current_mis = st.session_state.misurate_sel if st.session_state.misurate_sel else None
+        if current_mis:
+            pt_tab = pt_tab[pt_tab['misurata'].isin(current_mis)]
+
+        pt_tab['data'] = pd.to_datetime(pt_tab['data'])
+        pt_tab = pt_tab.sort_values('data')
+
+        if len(pt_tab) == 0:
+            st.info("Nessuna misurata disponibile per il punto selezionato nella selezione corrente.")
+        else:
+            # riferimento: prima misurata disponibile
+            base_x = pt_tab.iloc[0]['X']
+            base_y = pt_tab.iloc[0]['Y']
+            has_z  = 'Z' in pt_tab.columns and pt_tab['Z'].notna().any()
+            base_z = pt_tab.iloc[0]['Z'] if has_z else np.nan
+
+            # Δ rispetto alla prima misurata
+            pt_tab['ΔX'] = pt_tab['X'] - base_x
+            pt_tab['ΔY'] = pt_tab['Y'] - base_y
+            pt_tab['ΔZ'] = (pt_tab['Z'] - base_z) if has_z else np.nan
+
+            # distanze
+            pt_tab['dist.2D'] = np.sqrt(pt_tab['ΔX']**2 + pt_tab['ΔY']**2)
+            pt_tab['dist.3D'] = np.sqrt(pt_tab['ΔX']**2 + pt_tab['ΔY']**2 + (pt_tab['ΔZ']**2))
+
+            # etichette X/Y/Z ↔ Est/Nord/Quota in base al sistema di coordinate
+            coord_sys = meta.get('coord_sys', None)
+            is_utm = coord_sys in ('UTM32', 'UTM33', 'UTM')
+            x_lbl, y_lbl, z_lbl = ('Est','Nord','Quota') if is_utm else ('X','Y','Z')
+
+            # costruiamo la tabella nell’ordine richiesto
+            df_show = pd.DataFrame({
+                'Punto'   : str(sel_code),
+                'Misurata': pt_tab['misurata'],
+                'Data'    : pt_tab['data'].dt.date,
+                x_lbl     : pt_tab['X'],
+                y_lbl     : pt_tab['Y'],
+                z_lbl     : pt_tab['Z'] if has_z else np.nan,
+                'ΔX'      : pt_tab['ΔX'],
+                'ΔY'      : pt_tab['ΔY'],
+                'ΔZ'      : pt_tab['ΔZ'],
+                'dist.2D' : pt_tab['dist.2D'],
+                'dist.3D' : pt_tab['dist.3D'],
+            })
+
+            # arrotondamenti (se vuoi 3 decimali su numerici)
+            num_cols = [c for c in [x_lbl, y_lbl, z_lbl, 'ΔX', 'ΔY', 'ΔZ', 'dist.2D', 'dist.3D'] if c in df_show.columns]
+            for c in num_cols:
+                df_show[c] = pd.to_numeric(df_show[c], errors='coerce')
+            df_show[num_cols] = df_show[num_cols].round(3)
+
+            # visualizzazione
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+            # download Excel
+            @st.cache_data
+            def _to_xlsx_point(df: pd.DataFrame) -> bytes:
+                from io import BytesIO
+                buffer = BytesIO()
+                with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                    df.to_excel(writer, index=False, sheet_name=f"Punto_{sel_code}")
+                buffer.seek(0)
+                return buffer.getvalue()
+
+            st.download_button(
+                "⬇️ Scarica tabella (XLSX)",
+                data=_to_xlsx_point(df_show),
+                file_name=f"dati_punto_{sel_code}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )        
             
 st.divider()
